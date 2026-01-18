@@ -562,6 +562,56 @@ def record_attempt(conn: sqlite3.Connection, qid: int, user_answer: str, is_corr
     conn.commit()
 
 
+def fetch_attempts(conn: sqlite3.Connection, qid: int) -> List[sqlite3.Row]:
+    return conn.execute(
+        "SELECT id, ts, user_answer, is_correct, mode FROM attempt WHERE question_id=? ORDER BY id ASC",
+        (qid,),
+    ).fetchall()
+
+
+def fetch_last_attempt(conn: sqlite3.Connection, qid: int, mode: Optional[str] = None) -> Optional[sqlite3.Row]:
+    if mode:
+        r = conn.execute(
+            "SELECT id, ts, user_answer, is_correct, mode FROM attempt WHERE question_id=? AND mode=? ORDER BY id DESC LIMIT 1",
+            (qid, mode),
+        ).fetchone()
+        if r is not None:
+            return r
+    return conn.execute(
+        "SELECT id, ts, user_answer, is_correct, mode FROM attempt WHERE question_id=? ORDER BY id DESC LIMIT 1",
+        (qid,),
+    ).fetchone()
+
+
+def compute_unique_accuracy(conn: sqlite3.Connection) -> Tuple[int, int]:
+    """Return (correct_unique, judged_unique) by taking the latest judged attempt per question.
+
+    This avoids counting repeated submissions of the same question multiple times in accuracy.
+    """
+    row = conn.execute(
+        """
+        SELECT
+          SUM(CASE WHEN a.is_correct=1 THEN 1 ELSE 0 END) AS c,
+          COUNT(*) AS t
+        FROM attempt a
+        JOIN (
+          SELECT question_id, MAX(id) AS max_id
+          FROM attempt
+          WHERE is_correct IS NOT NULL
+          GROUP BY question_id
+        ) m
+        ON a.question_id=m.question_id AND a.id=m.max_id
+        """
+    ).fetchone()
+    if not row:
+        return 0, 0
+    return int(row[0] or 0), int(row[1] or 0)
+
+
+def compute_total_attempts(conn: sqlite3.Connection) -> int:
+    return int(conn.execute("SELECT COUNT(*) FROM attempt").fetchone()[0])
+
+
 def add_to_wrongbook(conn: sqlite3.Connection, qid: int) -> None:
     ts = now_ts()
     conn.execute(
@@ -923,6 +973,45 @@ class QuizApp(BaseWindow):
         self.text_answer.pack(fill="x")
         self.text_wrap.pack(fill="x", pady=(6, 6))
 
+        # Attempt history (only shown after the question has been attempted)
+        self.history_box = tk.Frame(pad, bg=PALETTE["card"])
+
+        self.history_row = tk.Frame(self.history_box, bg=PALETTE["card"])
+        self.history_row.pack(fill="x")
+
+        self.last_badge = tk.Label(
+            self.history_row,
+            text="",
+            font=ui_font(10, True),
+            fg=PALETTE["text"],
+            bg=PALETTE["option"],
+            padx=10,
+            pady=6,
+        )
+        self.last_badge.pack(side="left")
+
+        self.history_seq = tk.Label(
+            self.history_row,
+            text="",
+            font=ui_font(11, False),
+            fg=PALETTE["muted"],
+            bg=PALETTE["card"],
+        )
+        self.history_seq.pack(side="left", padx=(10, 0))
+
+        self.history_detail = tk.Label(
+            self.history_box,
+            text="",
+            font=ui_font(11, False),
+            fg=PALETTE["muted"],
+            bg=PALETTE["card"],
+            justify="left",
+            wraplength=880,
+        )
+        self.history_detail.pack(anchor="w", pady=(6, 0))
+
+        self.history_box.pack_forget()
+
         # Feedback block (colored)
         self.feedback = tk.Frame(
             pad,
@@ -971,16 +1060,8 @@ class QuizApp(BaseWindow):
         total_all = int(self.conn.execute("SELECT COUNT(*) FROM question").fetchone()[0])
         wrong = int(self.conn.execute("SELECT COUNT(*) FROM wrongbook").fetchone()[0])
 
-        row = self.conn.execute(
-            """
-            SELECT
-              SUM(CASE WHEN is_correct=1 THEN 1 ELSE 0 END) AS c,
-              SUM(CASE WHEN is_correct IS NOT NULL THEN 1 ELSE 0 END) AS t
-            FROM attempt
-            """
-        ).fetchone()
-        correct = int(row[0] or 0)
-        judged = int(row[1] or 0)
+        correct, judged = compute_unique_accuracy(self.conn)
+        total_attempts = compute_total_attempts(self.conn)
         acc = (correct / judged * 100.0) if judged else None
 
         # streak distribution in wrongbook
@@ -992,7 +1073,7 @@ class QuizApp(BaseWindow):
 
         # card top-right (compact)
         acc_text = f"正确率 {acc:.0f}%" if acc is not None else "正确率 --"
-        self.stats_label.config(text=f"{acc_text} · 错题本 {wrong} · 记录 {judged}")
+        self.stats_label.config(text=f"{acc_text} · 错题本 {wrong} · 已做 {judged} · 作答 {total_attempts}")
 
         # status bar badges
         self.badge_accuracy.config(text=acc_text)
@@ -1061,6 +1142,88 @@ class QuizApp(BaseWindow):
         self.single_selected = ""
         self.multi_selected.clear()
         self.option_buttons.clear()
+
+    def _format_attempt_history(self, attempts: List[sqlite3.Row]) -> Tuple[str, str]:
+        """Return (seq_text, detail_text) for a question."""
+        judged = [r for r in attempts if r[3] is not None]  # is_correct
+        # sequence like: 正确-错误-正确
+        seq_parts: List[str] = []
+        for r in judged[-20:]:
+            seq_parts.append("正确" if int(r[3]) == 1 else "错误")
+        seq_text = "历史：" + ("-".join(seq_parts) if seq_parts else "—")
+
+        # last attempt (prefer current mode, fallback to any)
+        last = None
+        cur_mode = self.mode_var.get()
+        for r in reversed(attempts):
+            if r[4] == cur_mode:
+                last = r
+                break
+        if last is None and attempts:
+            last = attempts[-1]
+        if not last:
+            return seq_text, ""
+
+        ua = (last[2] or "").strip().replace("\n", " ")
+        if len(ua) > 90:
+            ua = ua[:90] + "…"
+
+        res = last[3]
+        if res is None:
+            res_text = "未判定"
+        else:
+            res_text = "正确" if int(res) == 1 else "错误"
+        detail = f"上次：{res_text} · 你的答案：{ua if ua else '(空)'}"
+        return seq_text, detail
+
+    def _set_last_badge(self, is_correct: Optional[int]) -> None:
+        if is_correct is None:
+            bg, fg, txt = PALETTE["warn_bg"], PALETTE["warn_fg"], "上次未判定"
+        elif int(is_correct) == 1:
+            bg, fg, txt = PALETTE["success_bg"], PALETTE["success_fg"], "上次正确"
+        else:
+            bg, fg, txt = PALETTE["danger_bg"], PALETTE["danger_fg"], "上次错误"
+        self.last_badge.configure(text=txt, bg=bg, fg=fg)
+
+    def _restore_previous_answer(self, q: Dict[str, Any]) -> None:
+        """Restore last answer (prefer current mode) so going back keeps selection/history."""
+        qid = int(q["id"])
+        last = fetch_last_attempt(self.conn, qid, mode=self.mode_var.get())
+        if last is None:
+            return
+
+        user_answer = (last[2] or "").strip()
+        if q.get("options"):
+            if (q.get("qtype") or "").lower() == "multi":
+                self.multi_selected = set(norm_letters(user_answer))
+            else:
+                self.single_selected = norm_letters(user_answer)[:1] if user_answer else ""
+            self._refresh_selection_styles()
+        else:
+            # subjective: restore previous input
+            self.text_answer.delete("1.0", "end")
+            if user_answer:
+                self.text_answer.insert("1.0", user_answer)
+
+    def _render_history(self, q: Dict[str, Any]) -> None:
+        qid = int(q["id"])
+        attempts = fetch_attempts(self.conn, qid)
+        if not attempts:
+            self.history_box.pack_forget()
+            return
+
+        # badge: last attempt in current mode preferred
+        last = fetch_last_attempt(self.conn, qid, mode=self.mode_var.get())
+        if last is None:
+            last = attempts[-1]
+        self._set_last_badge(last[3])
+
+        seq_text, detail = self._format_attempt_history(attempts)
+        self.history_seq.configure(text=seq_text)
+        self.history_detail.configure(text=detail)
+
+        if not self.history_box.winfo_ismapped():
+            self.history_box.pack(fill="x", pady=(10, 0))
 
     def _set_feedback_style(self, kind: str, title: str, body: str) -> None:
         if kind == "success":
@@ -1165,6 +1328,7 @@ class QuizApp(BaseWindow):
         self.clear_options()
         self.text_answer.delete("1.0", "end")
         self._hide_feedback()
+        self.history_box.pack_forget()
 
         if not self.qids:
             self.meta_label.config(text="还没有题目。点击“导入文档”开始。")
@@ -1187,9 +1351,14 @@ class QuizApp(BaseWindow):
             self.text_wrap.pack_forget()
             for opt in opts:
                 self._make_option_button(opt.get("key", ""), opt.get("text", ""), qtype)
+            # restore last selection (if any)
+            self._restore_previous_answer(q)
             self._refresh_selection_styles()
         else:
             self.text_wrap.pack(fill="x", pady=(6, 6))
+            self._restore_previous_answer(q)
+
+        self._render_history(q)
 
         # update streak badge
         if self.mode_var.get() == "wrongbook":
@@ -1320,6 +1489,7 @@ class QuizApp(BaseWindow):
             self._show_feedback("danger", title, body)
 
         self._apply_result_styles(q, user_answer, is_correct)
+        self._render_history(q)
         self.update_stats()
 
     def mark_subjective(self, correct: bool) -> None:
@@ -1347,6 +1517,7 @@ class QuizApp(BaseWindow):
             self._show_feedback("success", "✅ 已标记正确", "已记录本次作答。")
         else:
             self._show_feedback("danger", "❌ 已标记错误", "已记录本次作答，并加入错题本。")
+        self._render_history(q)
         self.update_stats()
 
     def open_stats(self) -> None:
@@ -1367,16 +1538,8 @@ class QuizApp(BaseWindow):
         # compute stats
         total_all = int(self.conn.execute("SELECT COUNT(*) FROM question").fetchone()[0])
         wrong = int(self.conn.execute("SELECT COUNT(*) FROM wrongbook").fetchone()[0])
-        row = self.conn.execute(
-            """
-            SELECT
-              SUM(CASE WHEN is_correct=1 THEN 1 ELSE 0 END) AS c,
-              SUM(CASE WHEN is_correct IS NOT NULL THEN 1 ELSE 0 END) AS t
-            FROM attempt
-            """
-        ).fetchone()
-        correct = int(row[0] or 0)
-        judged = int(row[1] or 0)
+        correct, judged = compute_unique_accuracy(self.conn)
+        total_attempts = compute_total_attempts(self.conn)
         acc = (correct / judged * 100.0) if judged else None
 
         dist = {0: 0, 1: 0, 2: 0}
@@ -1425,7 +1588,8 @@ class QuizApp(BaseWindow):
 
         kpi_block("正确率", acc_text, PALETTE["badge_info_bg"], PALETTE["badge_info_fg"])
         kpi_block("错题本", str(wrong), PALETTE["danger_bg"], PALETTE["danger_fg"])
-        kpi_block("已判定作答", str(judged), PALETTE["warn_bg"], PALETTE["warn_fg"])
+        kpi_block("已做题", str(judged), PALETTE["warn_bg"], PALETTE["warn_fg"])
+        kpi_block("作答次数", str(total_attempts), PALETTE["option_sel"], PALETTE["text"])
 
         # distribution bar
         tk.Label(pad, text="错题连对分布（0/1/2）", font=ui_font(12, True), fg=PALETTE["text"], bg=PALETTE["card"]).pack(anchor="w", pady=(6, 6))
