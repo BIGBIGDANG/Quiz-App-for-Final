@@ -465,6 +465,11 @@ def init_db(db_path: Path) -> sqlite3.Connection:
             last_ts TEXT,
             FOREIGN KEY(question_id) REFERENCES question(id)
         );
+
+        CREATE TABLE IF NOT EXISTS app_state(
+            key TEXT PRIMARY KEY,
+            value TEXT
+        );
         """
     )
 
@@ -476,6 +481,18 @@ def init_db(db_path: Path) -> sqlite3.Connection:
         conn.execute("ALTER TABLE question ADD COLUMN source TEXT")
     conn.commit()
     return conn
+
+
+def state_get(conn: sqlite3.Connection, key: str) -> Optional[str]:
+    row = conn.execute("SELECT value FROM app_state WHERE key=?", (key,)).fetchone()
+    if row is None:
+        return None
+    return str(row[0])
+
+
+def state_set(conn: sqlite3.Connection, key: str, value: str) -> None:
+    conn.execute("INSERT OR REPLACE INTO app_state(key, value) VALUES (?, ?)", (key, value))
+    conn.commit()
 
 
 def upsert_questions(conn: sqlite3.Connection, questions: List[Dict[str, Any]]) -> Tuple[int, int]:
@@ -730,6 +747,7 @@ class QuizApp(BaseWindow):
 
         # state
         self.mode_var = tk.StringVar(value="normal")  # normal / wrongbook
+        self.active_mode = self.mode_var.get()
         self.shuffle_var = tk.BooleanVar(value=False)
 
         self.qids: List[int] = []
@@ -761,7 +779,8 @@ class QuizApp(BaseWindow):
         except Exception:
             pass
 
-        self.refresh_question_list(reset_idx=True)
+        self.refresh_question_list(reset_idx=False)
+        self._restore_progress_for_mode(self.mode_var.get())
         self.load_current()
 
         # keyboard shortcuts
@@ -817,7 +836,7 @@ class QuizApp(BaseWindow):
             controls,
             text="随机",
             variable=self.shuffle_var,
-            command=lambda: self.refresh_question_list(reset_idx=True),
+            command=self.on_shuffle_change,
         ).pack(side="left", padx=10)
 
         ttk.Label(controls, text="跳到：").pack(side="left")
@@ -1055,6 +1074,48 @@ class QuizApp(BaseWindow):
         ttk.Button(right, text="手动标记错误", command=lambda: self.mark_subjective(False)).pack(side="left")
 
     # ---------------- state helpers ----------------
+    def _progress_key(self, mode: str, field: str) -> str:
+        sh = 1 if self.shuffle_var.get() else 0
+        return f"progress:{mode}:shuffle{sh}:{field}"
+
+    def _save_progress(self, mode: str) -> None:
+        if not self.qids:
+            return
+        try:
+            qid = int(self.qids[self.idx])
+        except Exception:
+            return
+        state_set(self.conn, self._progress_key(mode, 'qid'), str(qid))
+        state_set(self.conn, self._progress_key(mode, 'idx'), str(int(self.idx)))
+
+    def _restore_progress_for_mode(self, mode: str) -> None:
+        if not self.qids:
+            self.idx = 0
+            return
+        qid_s = state_get(self.conn, self._progress_key(mode, 'qid'))
+        idx_s = state_get(self.conn, self._progress_key(mode, 'idx'))
+        saved_qid = None
+        if qid_s and str(qid_s).strip().isdigit():
+            saved_qid = int(str(qid_s).strip())
+        saved_idx = 0
+        if idx_s and str(idx_s).strip().isdigit():
+            saved_idx = int(str(idx_s).strip())
+        if saved_qid is not None and saved_qid in self.qids:
+            self.idx = self.qids.index(saved_qid)
+        else:
+            self.idx = max(0, min(saved_idx, len(self.qids) - 1))
+
+    def on_shuffle_change(self) -> None:
+        # Keep current question when possible
+        cur_mode = self.mode_var.get()
+        cur_qid = self.qids[self.idx] if self.qids else None
+        self.qids = list_question_ids(self.conn, cur_mode, self.shuffle_var.get())
+        if cur_qid is not None and cur_qid in self.qids:
+            self.idx = self.qids.index(cur_qid)
+        else:
+            self._restore_progress_for_mode(cur_mode)
+        self.load_current()
+
     def update_stats(self) -> None:
         # overall stats
         total_all = int(self.conn.execute("SELECT COUNT(*) FROM question").fetchone()[0])
@@ -1096,9 +1157,14 @@ class QuizApp(BaseWindow):
         if reset_idx:
             self.idx = 0
         self.update_stats()
-
     def on_mode_change(self) -> None:
-        self.refresh_question_list(reset_idx=True)
+        # When switching mode, remember current progress and restore last position in the new mode
+        prev_mode = getattr(self, 'active_mode', 'normal')
+        self._save_progress(prev_mode)
+        new_mode = self.mode_var.get()
+        self.active_mode = new_mode
+        self.qids = list_question_ids(self.conn, new_mode, self.shuffle_var.get())
+        self._restore_progress_for_mode(new_mode)
         self.load_current()
 
     def on_jump(self) -> None:
@@ -1132,7 +1198,8 @@ class QuizApp(BaseWindow):
             return
 
         messagebox.showinfo("导入完成", f"识别到 {len(qs)} 道题\n新增 {ins}，去重跳过 {skip}")
-        self.refresh_question_list(reset_idx=True)
+        self.refresh_question_list(reset_idx=False)
+        self._restore_progress_for_mode(self.mode_var.get())
         self.load_current()
 
     # ---------------- rendering ----------------
@@ -1373,6 +1440,8 @@ class QuizApp(BaseWindow):
 
         self.canvas.yview_moveto(0.0)
         self.update_stats()
+        self._save_progress(self.mode_var.get())
+        self.active_mode = self.mode_var.get()
 
     # ---------------- navigation ----------------
     def prev(self) -> None:
