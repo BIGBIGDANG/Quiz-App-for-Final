@@ -1,4 +1,4 @@
-# Quiz App（离线本地刷题 / Ins 风 UI）
+# Quiz App
 
 离线本地刷题软件：支持从 Word/文档导入题库，逐题刷题（每题一页）、错题本与统计面板。
 
@@ -55,13 +55,13 @@ python app.py
 
 > 想清空数据：关闭程序后删除 `quiz.db`。
 
-## 项目结构（与压缩包一致）
+## 项目结构
 ```
 quiz_app_mvp_ins/
 ├─ app.py
 ├─ requirements.txt
 ├─ quiz.db
-├─ 期末复习题库 (1).doc
+├─ 计算机网络题库.doc
 ├─ assets/
 │  ├─ home.png
 │  ├─ question.png
