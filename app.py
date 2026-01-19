@@ -141,7 +141,7 @@ def extract_plain_text(file_path: Path) -> str:
                         row_text.append(t)
                 if row_text:
                     parts.append("\t".join(row_text))
-        return normalize_spaces("\n".join(parts))
+        return normalize_spaces("\n\n".join(parts))
 
     if suf == ".doc":
         data = file_path.read_bytes()
@@ -177,12 +177,13 @@ def extract_plain_text(file_path: Path) -> str:
 """
 
 SECTION_PATTERNS: List[Tuple[re.Pattern, str]] = [
-    (re.compile(r"(?m)^\s*(?:[一二三四五六七八九十\d]+[、\.]\s*)?(?:单项选择题|单选题)\s*$"), "单选题"),
-    (re.compile(r"(?m)^\s*(?:[一二三四五六七八九十\d]+[、\.]\s*)?(?:多项选择题|多选题)\s*$"), "多选题"),
-    (re.compile(r"(?m)^\s*(?:[一二三四五六七八九十\d]+[、\.]\s*)?判断题\s*$"), "判断题"),
-    (re.compile(r"(?m)^\s*(?:[一二三四五六七八九十\d]+[、\.]\s*)?填空题\s*$"), "填空题"),
-    (re.compile(r"(?m)^\s*(?:[一二三四五六七八九十\d]+[、\.]\s*)?阅读理解\s*$"), "阅读理解"),
-    (re.compile(r"(?m)^\s*(?:[一二三四五六七八九十\d]+[、\.]\s*)?简答题\s*$"), "简答题"),
+    # 兼容："一、选择题（...）" / "单选题" / "单项选择题"
+    (re.compile(r"(?m)^\s*(?:[一二三四五六七八九十\d]+[、\.]\s*)?(?:单项选择题|单选题|选择题)(?:\s*[（(].*?[）)])?\s*$"), "单选题"),
+    (re.compile(r"(?m)^\s*(?:[一二三四五六七八九十\d]+[、\.]\s*)?(?:多项选择题|多选题)(?:\s*[（(].*?[）)])?\s*$"), "多选题"),
+    (re.compile(r"(?m)^\s*(?:[一二三四五六七八九十\d]+[、\.]\s*)?判断题(?:\s*[（(].*?[）)])?\s*$"), "判断题"),
+    (re.compile(r"(?m)^\s*(?:[一二三四五六七八九十\d]+[、\.]\s*)?填空题(?:\s*[（(].*?[）)])?\s*$"), "填空题"),
+    (re.compile(r"(?m)^\s*(?:[一二三四五六七八九十\d]+[、\.]\s*)?阅读理解(?:\s*[（(].*?[）)])?\s*$"), "阅读理解"),
+    (re.compile(r"(?m)^\s*(?:[一二三四五六七八九十\d]+[、\.]\s*)?简答题(?:\s*[（(].*?[）)])?\s*$"), "简答题"),
 ]
 
 
@@ -400,27 +401,105 @@ def split_reading_block(block_text: str, number_in_source: int, source_name: str
     return out
 
 
+def _looks_like_option_block(s: str) -> bool:
+    return bool(re.search(r"(?m)^\s*[A-H][、\.)]\s+", s))
+
+
+def _match_section_header(para: str) -> Optional[str]:
+    t = (para or "").strip()
+    if not t:
+        return None
+    for pat, name in SECTION_PATTERNS:
+        if pat.match(t):
+            return name
+    return None
+
+
+def parse_questions_ai_style(text: str, source_name: str) -> List[Dict[str, Any]]:
+    """解析无显式题号的题库（常见 AI 生成/整理格式）。
+
+    支持：
+    - 选择题：题干+选项+“答案：X”+“解析：...”可在同一段落或跨段落
+    - 判断题/填空题：题干一段，后接“答案：...”“解析：...”两段
+    """
+    # 以双换行分段（extract_plain_text 会把 docx 段落用 "\n\n" 拼接）
+    paras = [p.strip() for p in text.split("\n\n") if p.strip()]
+
+    out: List[Dict[str, Any]] = []
+    section = "未知"
+    seq = 1
+    i = 0
+
+    while i < len(paras):
+        p = paras[i]
+
+        # section header
+        sec = _match_section_header(p)
+        if sec:
+            section = sec
+            i += 1
+            continue
+
+        # 1) 段内包含答案标记：通常是“选择题整段”或“题干+答案+解析”同段
+        if re.search(r"(?m)^\s*(正确答案|参考答案|答案)\s*[:：]", p):
+            out.extend(parse_block_common(p, seq, section, source_name))
+            seq += 1
+            i += 1
+            continue
+
+        # 2) 跨段：题干段 + 答案段 (+ 解析段)
+        if i + 1 < len(paras):
+            nxt = paras[i + 1]
+            first_line = nxt.split("\n", 1)[0].strip()
+            if ANS_MARK.match(first_line):
+                block = p + "\n" + nxt
+                j = i + 2
+                if j < len(paras):
+                    maybe_ana = paras[j]
+                    ana_first = maybe_ana.split("\n", 1)[0].strip()
+                    if ANA_MARK.match(ana_first):
+                        block = block + "\n" + maybe_ana
+                        j += 1
+                out.extend(parse_block_common(block, seq, section, source_name))
+                seq += 1
+                i = j
+                continue
+
+        # default: skip
+        i += 1
+
+    return out
+
+
 def parse_questions(plain_text: str, source_name: str) -> List[Dict[str, Any]]:
     text = normalize_spaces(plain_text)
     markers = build_section_markers(text)
 
     ms = list(QSTART.finditer(text))
-    blocks: List[Tuple[int, int, int]] = []
-    for i, m in enumerate(ms):
-        start = m.start()
-        end = ms[i + 1].start() if i + 1 < len(ms) else len(text)
-        blocks.append((start, end, int(m.group(1))))
 
-    out: List[Dict[str, Any]] = []
-    for start, end, number in blocks:
-        section = section_at(markers, start)
-        block = text[start:end].strip()
-        if section == "阅读理解":
-            out.extend(split_reading_block(block, number, source_name))
-        else:
-            out.extend(parse_block_common(block, number, section, source_name))
+    # 先尝试“带题号”的经典格式
+    if ms:
+        blocks: List[Tuple[int, int, int]] = []
+        for i, m in enumerate(ms):
+            start = m.start()
+            end = ms[i + 1].start() if i + 1 < len(ms) else len(text)
+            blocks.append((start, end, int(m.group(1))))
 
-    return out
+        out: List[Dict[str, Any]] = []
+        for start, end, number in blocks:
+            section = section_at(markers, start)
+            block = text[start:end].strip()
+            if section == "阅读理解":
+                out.extend(split_reading_block(block, number, source_name))
+            else:
+                out.extend(parse_block_common(block, number, section, source_name))
+
+        # 若解析结果太少（可能是无题号格式），再用 AI-style 补充
+        if len(out) >= 5:
+            return out
+
+    # 无题号/AI 整理格式
+    return parse_questions_ai_style(text, source_name)
 
 
 # -----------------------------
